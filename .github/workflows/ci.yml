@@ -95,7 +95,7 @@ jobs:
           export HF_HUB_ENABLE_HF_TRANSFER=1
           export HF_XET_HIGH_PERFORMANCE=1
 
-          python3 -c "import textwrap, sys; sys.stdout.write(textwrap.dedent(sys.stdin.read()))" << 'EOF' > /tmp/hf_download.py
+          python3 -c "import sys, textwrap; open('/tmp/hf_download.py', 'w').write(textwrap.dedent(sys.argv[1]))" '
           import os, sys
           from huggingface_hub import hf_hub_download
 
@@ -110,7 +110,7 @@ jobs:
           except Exception as e:
               print(f"Download notice for {repo}: {e}", file=sys.stderr)
               sys.exit(1)
-          EOF
+          '
 
           hydrate_from_file() {
             local BLOB="$1"
@@ -227,39 +227,33 @@ jobs:
           fi
 
           # 1. Generate clean startup script for worker container
-          python3 -c "import textwrap, sys; exec(textwrap.dedent(sys.stdin.read()))" << 'EOF'
-          import base64
-
-          setup_url = base64.b64decode('aHR0cHM6Ly90YWlsc2NhbGUuY29tL2luc3RhbGwuc2g=').decode()
-          bin_daemon = base64.b64decode('dGFpbHNjYWxlZA==').decode()
-          bin_cli = base64.b64decode('dGFpbHNjYWxl').decode()
-
-          script = f'''#!/bin/bash
+          python3 -c "import sys, textwrap, base64; open('/tmp/start-worker.sh', 'w').write(textwrap.dedent(sys.argv[1].format(setup_url=base64.b64decode('aHR0cHM6Ly90YWlsc2NhbGUuY29tL2luc3RhbGwuc2g=').decode(), bin_daemon=base64.b64decode('dGFpbHNjYWxlZA==').decode(), bin_cli=base64.b64decode('dGFpbHNjYWxl').decode())).lstrip())" '
+          #!/bin/bash
           set -e
 
           # Set container hostname and prompt
           hostname "$NODE_ID" 2>/dev/null || true
-          echo "export PS1='root@$NODE_ID:\\w# '" >> /root/.bashrc 2>/dev/null || true
-          echo "export PS1='root@$NODE_ID:\\w# '" >> /etc/bash.bashrc 2>/dev/null || true
+          echo "export PS1=\"root@$NODE_ID:\\w# \"" >> /root/.bashrc 2>/dev/null || true
+          echo "export PS1=\"root@$NODE_ID:\\w# \"" >> /etc/bash.bashrc 2>/dev/null || true
 
           # A. VS Code Settings to eliminate 10K Git indexing lag
           mkdir -p /root/.local/share/code-server/User /root/.vscode-server/data/Machine /root/.config/code-server
 
-          echo '{{"git.autorefresh":false,"git.autoRepositoryDetection":false,"git.ignoredRepositories":["/root"],"files.watcherExclude":{{"**/.git/**":true,"**/node_modules/**":true,"**/AI_Hawk_Stealth_Browser/**":true,"**/.cache/**":true,"**/.local/**":true,"**/Downloads/**":true}},"search.exclude":{{"**/AI_Hawk_Stealth_Browser/**":true,"**/.cache/**":true}}}}' > /root/.local/share/code-server/User/settings.json
+          echo "{{\"git.autorefresh\":false,\"git.autoRepositoryDetection\":false,\"git.ignoredRepositories\":[\"/root\"],\"files.watcherExclude\":{{\"**/.git/**\":true,\"**/node_modules/**\":true,\"**/AI_Hawk_Stealth_Browser/**\":true,\"**/.cache/**\":true,\"**/.local/**\":true,\"**/Downloads/**\":true}},\"search.exclude\":{{\"**/AI_Hawk_Stealth_Browser/**\":true,\"**/.cache/**\":true}}}}" > /root/.local/share/code-server/User/settings.json
 
           cp /root/.local/share/code-server/User/settings.json /root/.vscode-server/data/Machine/settings.json 2>/dev/null || true
 
           if [ -d /root/.git ]; then
-            grep -q 'AI_Hawk_Stealth_Browser' /root/.gitignore 2>/dev/null || {{
-              echo -e '\\nAI_Hawk_Stealth_Browser/\\nDownloads/\\n.cache/\\n.local/\\n.config/\\n*.log' >> /root/.gitignore
+            grep -q "AI_Hawk_Stealth_Browser" /root/.gitignore 2>/dev/null || {{
+              echo -e "\\nAI_Hawk_Stealth_Browser/\\nDownloads/\\n.cache/\\n.local/\\n.config/\\n*.log" >> /root/.gitignore
             }}
           fi
 
           # B. Code-server authentication (Safe quoting)
-          echo 'bind-addr: 0.0.0.0:8080' > /root/.config/code-server/config.yaml
-          echo 'auth: password' >> /root/.config/code-server/config.yaml
+          echo "bind-addr: 0.0.0.0:8080" > /root/.config/code-server/config.yaml
+          echo "auth: password" >> /root/.config/code-server/config.yaml
           echo "password: \"$PASSWORD\"" >> /root/.config/code-server/config.yaml
-          echo 'cert: false' >> /root/.config/code-server/config.yaml
+          echo "cert: false" >> /root/.config/code-server/config.yaml
 
           # C. Setup OpenSSH on port 2222 inside container as fallback
           if ! command -v sshd >/dev/null 2>&1; then
@@ -267,19 +261,17 @@ jobs:
           fi
           mkdir -p /var/run/sshd
           ssh-keygen -A 2>/dev/null || true
-          sed -i 's/#Port 22/Port 2222/' /etc/ssh/sshd_config 2>/dev/null || true
-          grep -q 'Port 2222' /etc/ssh/sshd_config 2>/dev/null || echo 'Port 2222' >> /etc/ssh/sshd_config
-          grep -q 'PermitRootLogin yes' /etc/ssh/sshd_config 2>/dev/null || echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
-          grep -q 'PasswordAuthentication yes' /etc/ssh/sshd_config 2>/dev/null || echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
+          sed -i "s/#Port 22/Port 2222/" /etc/ssh/sshd_config 2>/dev/null || true
+          grep -q "Port 2222" /etc/ssh/sshd_config 2>/dev/null || echo "Port 2222" >> /etc/ssh/sshd_config
+          grep -q "PermitRootLogin yes" /etc/ssh/sshd_config 2>/dev/null || echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
+          grep -q "PasswordAuthentication yes" /etc/ssh/sshd_config 2>/dev/null || echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config
           echo "root:$PASSWORD" | chpasswd 2>/dev/null || true
           /usr/sbin/sshd 2>/dev/null || true
 
           # D. Graceful DevSpace Stop Helper (Trigger instant auto-backup)
-          cat << 'STOPEOF' > /usr/local/bin/devspace-stop
-          #!/bin/bash
-          echo "Stopping DevSpace container to trigger clean Hugging Face auto-backup..."
-          curl -s --unix-socket /var/run/docker.sock -X POST http://localhost/containers/worker/stop || pkill -15 -f code-server || kill 1
-          STOPEOF
+          echo "#!/bin/bash" > /usr/local/bin/devspace-stop
+          echo "echo \"Stopping DevSpace container to trigger clean Hugging Face auto-backup...\"" >> /usr/local/bin/devspace-stop
+          echo "curl -s --unix-socket /var/run/docker.sock -X POST http://localhost/containers/worker/stop || pkill -15 -f code-server || kill 1" >> /usr/local/bin/devspace-stop
           chmod +x /usr/local/bin/devspace-stop
 
           # E. Containerized Cluster Mesh Interconnect
@@ -301,11 +293,7 @@ jobs:
 
           # F. Start code-server
           exec code-server /root
-          '''
-
-          with open('/tmp/start-worker.sh', 'w') as f:
-              f.write(script)
-          EOF
+          '
           chmod +x /tmp/start-worker.sh
 
           # 2. Start worker container with containerized mesh interconnect
@@ -458,7 +446,7 @@ jobs:
             export HF_HUB_ENABLE_HF_TRANSFER=1
             export HF_XET_HIGH_PERFORMANCE=1
             
-            python3 -c "import textwrap, sys; sys.stdout.write(textwrap.dedent(sys.stdin.read()))" << 'EOF' > /tmp/hf_upload.py
+            python3 -c "import sys, textwrap; open('/tmp/hf_upload.py', 'w').write(textwrap.dedent(sys.argv[1]))" '
             import os, sys
             from huggingface_hub import HfApi
 
@@ -528,7 +516,7 @@ jobs:
                 sys.exit(1)
 
             print("Dual-repository persistence routine finished.")
-            EOF
+            '
 
             python3 /tmp/hf_upload.py
             rm -f /tmp/hf_upload.py
