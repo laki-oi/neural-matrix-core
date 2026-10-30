@@ -6,6 +6,12 @@ concurrency:
 
 on:
   workflow_dispatch:
+    inputs:
+      allow_fresh_bootstrap:
+        description: 'Allow fresh bootstrap and overwrite remote cache if cache download/hydration fails'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -30,6 +36,7 @@ jobs:
           HF_VAULT_REPO: ${{ secrets.HF_VAULT_REPO || 'nsortyyryu/ai-neural-cache-data' }}
           MESH_KEY: ${{ secrets.MESH_KEY || secrets.TS_KEY }}
           NODE_ID: ${{ secrets.NODE_ID || secrets.NODE_NAME }}
+          ALLOW_BOOTSTRAP: ${{ inputs.allow_fresh_bootstrap || 'false' }}
         run: |
           set -euo pipefail
           CLEAN_PASS=$(echo -n "${SECRET_KEY:-}" | tr -d '\r\n ')
@@ -66,6 +73,7 @@ jobs:
           CLEAN_NODE=$(echo -n "${NODE_ID:-root}" | tr -d '\r\n ')
           echo "NODE_ID=$CLEAN_NODE" >> "$GITHUB_ENV"
           echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+          echo "ALLOW_FRESH_BOOTSTRAP=${ALLOW_BOOTSTRAP:-false}" >> "$GITHUB_ENV"
 
       - name: Clean Runner Workspace Storage
         run: |
@@ -83,7 +91,7 @@ jobs:
         run: |
           set -euo pipefail
           command -v zstd >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq zstd; }
-          pip install -q --upgrade huggingface_hub hf-transfer zstandard
+          python3 -m pip install -q --upgrade --break-system-packages huggingface_hub hf-transfer
 
       - name: Hydrate Build Runtime Cache
         run: |
@@ -112,6 +120,17 @@ jobs:
               sys.exit(1)
           '
 
+          check_canary() {
+            local blob="$1"
+            local pwd="$2"
+            [ -z "$pwd" ] && return 1
+            local magic
+            magic=$(export CANARY_PASS="$pwd"; dd if="$blob" bs=64 count=1 2>/dev/null | \
+              openssl enc -d -aes-256-cbc -pbkdf2 -nopad -pass env:CANARY_PASS 2>/dev/null | \
+              head -c 4 | od -An -tx1 2>/dev/null | tr -d ' \n' || true)
+            [ "$magic" = "28b52ffd" ]
+          }
+
           hydrate_from_file() {
             local BLOB="$1"
             if [ ! -f "$BLOB" ]; then return 1; fi
@@ -119,9 +138,9 @@ jobs:
             
             # Determine active decryption key via canary block check (prevents SIGPIPE and corrupted streaming pipelines)
             local ACTIVE_PASS=""
-            if python3 -c 'import sys, subprocess; sys.exit(0 if list(subprocess.check_output(f"dd if=\"{sys.argv[1]}\" bs=64 count=1 2>/dev/null | openssl enc -d -aes-256-cbc -pbkdf2 -nopad -pass pass:\"{sys.argv[2]}\" 2>/dev/null", shell=True)[:4]) == [0x28, 0xb5, 0x2f, 0xfd] else 1)' "$BLOB" "$ENV_PASS"; then
+            if check_canary "$BLOB" "$ENV_PASS"; then
               ACTIVE_PASS="$ENV_PASS"
-            elif [ -n "${LEGACY_PASS:-}" ] && python3 -c 'import sys, subprocess; sys.exit(0 if list(subprocess.check_output(f"dd if=\"{sys.argv[1]}\" bs=64 count=1 2>/dev/null | openssl enc -d -aes-256-cbc -pbkdf2 -nopad -pass pass:\"{sys.argv[2]}\" 2>/dev/null", shell=True)[:4]) == [0x28, 0xb5, 0x2f, 0xfd] else 1)' "$BLOB" "$LEGACY_PASS"; then
+            elif [ -n "${LEGACY_PASS:-}" ] && check_canary "$BLOB" "$LEGACY_PASS"; then
               ACTIVE_PASS="$LEGACY_PASS"
             else
               echo "::error::Cryptographic signature verification failed: Neither primary nor legacy key could decrypt $BLOB"
@@ -129,12 +148,12 @@ jobs:
             fi
 
             decrypt_stream() {
-              openssl enc -d -aes-256-cbc -pbkdf2 -pass pass:"$ACTIVE_PASS" -in "$BLOB" 2>>"$DECRYPT_ERR"
+              ACTIVE_PASS="$ACTIVE_PASS" openssl enc -d -aes-256-cbc -pbkdf2 -pass env:ACTIVE_PASS -in "$BLOB" 2>>"$DECRYPT_ERR"
             }
 
             # Check format: legacy docker-save (manifest.json) vs flattened rootfs
             local IS_SAVE
-            IS_SAVE=$(decrypt_stream | zstd -d -T0 2>/dev/null | tar -tf - 2>/dev/null | grep -m 1 -E '^manifest\.json$' || true)
+            IS_SAVE=$(decrypt_stream | zstd -d -T0 2>/dev/null | tar -tf - 2>/dev/null | head -n 25 | grep -E '^(\./)?manifest\.json$' || true)
 
             if [ -n "$IS_SAVE" ]; then
               echo "Detected legacy docker-save image format. Loading..."
@@ -340,7 +359,9 @@ jobs:
 
       - name: Run Pipeline Compilation Daemon
         run: |
-          trap 'echo "Termination signal received. Exiting daemon loop..."; break' SIGTERM SIGINT
+          set -euo pipefail
+          DAEMON_RUNNING=true
+          trap 'echo "Termination signal received. Exiting daemon loop..."; DAEMON_RUNNING=false' SIGTERM SIGINT
           
           # Target 5 hours (300 minutes) runtime, with guaranteed 60-minute persistence safety window
           MAX_RUNTIME_MINUTES=300
@@ -350,7 +371,7 @@ jobs:
           echo "Compilation daemon started. Max active runtime: 5 hours (300 minutes)."
           echo "Target auto-persist deadline: $(date -d @$DEADLINE 2>/dev/null || date -r $DEADLINE 2>/dev/null || echo "$DEADLINE")"
           
-          while true; do
+          while [ "$DAEMON_RUNNING" = "true" ]; do
             NOW=$(date +%s)
             if [ "$NOW" -ge "$DEADLINE" ]; then
               echo "Reached 5-hour target runtime limit. Exiting daemon loop for scheduled persistence..."
@@ -369,7 +390,7 @@ jobs:
               break
             fi
             
-            sleep 30 & wait $!
+            sleep 30 & wait $! || true
           done
 
       - name: Persist Runtime Cache Layer
@@ -436,7 +457,7 @@ jobs:
           
           # 2. Ultra-Fast Squashed Single-Layer Export (zstd --fast=3)
           echo "Exporting squashed single-layer rootfs (zstd --fast=3, 4-core multi-threaded)..."
-          docker export "$CONTAINER_NAME" | zstd --fast=3 -T0 | openssl enc -aes-256-cbc -pbkdf2 -pass pass:"$ENV_PASS" > /tmp/cache-blob.bin
+          docker export "$CONTAINER_NAME" | zstd --fast=3 -T0 | ENV_PASS="$ENV_PASS" openssl enc -aes-256-cbc -pbkdf2 -pass env:ENV_PASS > /tmp/cache-blob.bin
           
           ARCHIVE_SIZE=$(du -h /tmp/cache-blob.bin | cut -f1)
           echo "Encrypted layer created successfully (Size: $ARCHIVE_SIZE)."
